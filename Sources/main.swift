@@ -1,6 +1,19 @@
 import AppKit
 import IOKit.pwr_mgt
 
+struct DurationChoice {
+    let title: String
+    let seconds: Int
+    static let all: [DurationChoice] = [
+        .init(title: "30 分钟", seconds: 1800),
+        .init(title: "1 小时", seconds: 3600),
+        .init(title: "2 小时", seconds: 7200),
+        .init(title: "3 小时", seconds: 10800),
+        .init(title: "6 小时", seconds: 21600),
+        .init(title: "12 小时", seconds: 43200),
+        .init(title: "直到手动停止", seconds: 0)
+    ]
+}
 protocol PowerHolding: AnyObject {
     func acquire() throws
     func release()
@@ -81,9 +94,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusLine = NSMenuItem(title: "常亮 · 已关闭", action: nil, keyEquivalent: "")
         menu.addItem(statusLine)
         menu.addItem(.separator())
-        for (title, seconds) in [("保持 30 分钟", 1800), ("保持 1 小时", 3600), ("保持 2 小时", 7200), ("保持至手动停止", 0)] {
-            let item = NSMenuItem(title: title, action: #selector(start(_:)), keyEquivalent: "")
-            item.target = self; item.tag = seconds; menu.addItem(item)
+        for choice in DurationChoice.all {
+            let item = NSMenuItem(title: choice.seconds == 0 ? "保持至手动停止" : "保持 " + choice.title, action: #selector(start(_:)), keyEquivalent: "")
+            item.target = self; item.tag = choice.seconds; menu.addItem(item)
         }
         stopItem = NSMenuItem(title: "停止保持", action: #selector(stop), keyEquivalent: "")
         stopItem.target = self; menu.addItem(stopItem)
@@ -114,7 +127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let state = NSTextField(labelWithString: "已关闭")
         state.frame = NSRect(x: 24, y: 145, width: 312, height: 22); view.addSubview(state); panelStatus = state
         let picker = NSPopUpButton(frame: NSRect(x: 22, y: 101, width: 178, height: 28))
-        picker.addItems(withTitles: ["30 分钟", "1 小时", "2 小时", "直到手动停止"]); picker.selectItem(at: 1); view.addSubview(picker); durationPicker = picker
+        picker.addItems(withTitles: DurationChoice.all.map { $0.title }); picker.selectItem(at: 1); view.addSubview(picker); durationPicker = picker
         let start = NSButton(title: "开启", target: self, action: #selector(startFromPanel)); start.bezelStyle = .rounded; start.frame = NSRect(x: 210, y: 99, width: 62, height: 32); view.addSubview(start)
         let stop = NSButton(title: "停止", target: self, action: #selector(stop)); stop.bezelStyle = .rounded; stop.frame = NSRect(x: 276, y: 99, width: 62, height: 32); view.addSubview(stop)
         let note = NSTextField(wrappingLabelWithString: "临时暂停屏保和自动灭屏。到时恢复。\n手动锁屏与密码保护不变。")
@@ -122,7 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel = window; window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); refresh()
     }
     @objc func startFromPanel() {
-        let item = NSMenuItem(); item.tag = [1800, 3600, 7200, 0][durationPicker?.indexOfSelectedItem ?? 1]; start(item)
+        let item = NSMenuItem(); item.tag = DurationChoice.all[durationPicker?.indexOfSelectedItem ?? 1].seconds; start(item)
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showPanel(); return true }
     func menuWillOpen(_ menu: NSMenu) { session.tick(); refresh() }
@@ -166,6 +179,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 func selfTest() {
+    assert(DurationChoice.all.map { $0.seconds } == [1800, 3600, 7200, 10800, 21600, 43200, 0])
+    assert(Set(DurationChoice.all.map { $0.title }).count == 7)
     final class Mock: PowerHolding {
         var held = false; var fail = false
         func acquire() throws { if fail { throw PowerError(code: -1) }; held = true }
@@ -186,13 +201,18 @@ func selfTest() {
     s.tick(uptime: 110); assert(!s.active)
     try! s.start(seconds: 10, now: t.addingTimeInterval(86400), uptime: 100)
     s.tick(uptime: 110); assert(!s.active)
+    for choice in DurationChoice.all where choice.seconds > 0 {
+        try! s.start(seconds: Double(choice.seconds), now: t, uptime: 100)
+        s.tick(uptime: 100 + Double(choice.seconds) - 1); assert(s.active)
+        s.tick(uptime: 100 + Double(choice.seconds)); assert(!s.active)
+    }
     p.fail = true
     do { try s.start(seconds: 10); assertionFailure("Expected failure") } catch { assert(!s.active && !p.held) }
     let failedRestore = StatusPresentation(active: false, remaining: nil, error: "mock failure")
     assert(failedRestore.title.contains("恢复失败") && failedRestore.canStop && failedRestore.symbol == "exclamationmark.triangle.fill")
     let off = StatusPresentation(active: false, remaining: nil, error: nil)
     assert(off.title == "常亮 · 已关闭" && !off.canStop)
-    print("PASS: monotonic expiry despite wall-clock jumps; recovery-error display/retry; default-off, start, expiry, duration replacement, indefinite, repeated stop, acquisition failure. No real assertions created.")
+    print("PASS: 7 duration choices including 3/6/12 hours; monotonic expiry despite wall-clock jumps; recovery-error display/retry; default-off, start, expiry, duration replacement, indefinite, repeated stop, acquisition failure. No real assertions created.")
 }
 if CommandLine.arguments.contains("--restore-guardian") { runGuardian() }
 else if CommandLine.arguments.contains("--test-lock-holder") {
