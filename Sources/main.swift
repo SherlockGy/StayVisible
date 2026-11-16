@@ -75,39 +75,36 @@ struct StatusPresentation {
         }
     }
 }
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    let hold = SaverHold()
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let hold: SessionHolding
+    let previewMode: Bool
+    init(hold: SessionHolding = SaverHold(), preview: Bool = false) {
+        self.hold = hold; previewMode = preview; super.init()
+    }
     lazy var session = Session(power: hold)
     var status: NSStatusItem!
     var timer: Timer?
     var observers: [NSObjectProtocol] = []
-    var statusLine = NSMenuItem()
-    var stopItem = NSMenuItem()
     var startedBefore = false
-    var panel: NSWindow?
+    var panel: TransientPanel?
     var panelStatus: NSTextField?
     var durationPicker: NSPopUpButton?
+    // Optional one-time migration deadline; never enables a session by itself.
+    let migrationDeadline: Date? = {
+        let args = CommandLine.arguments
+        guard let index = args.firstIndex(of: "--resume-until"), args.indices.contains(index + 1),
+              let date = ISO8601DateFormatter().date(from: args[index + 1]),
+              date > Date(), date.timeIntervalSinceNow <= 43200 else { return nil }
+        return date
+    }()
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        let menu = NSMenu(); menu.delegate = self
-        statusLine = NSMenuItem(title: "常亮 · 已关闭", action: nil, keyEquivalent: "")
-        menu.addItem(statusLine)
-        menu.addItem(.separator())
-        for choice in DurationChoice.all {
-            let item = NSMenuItem(title: choice.seconds == 0 ? "保持至手动停止" : "保持 " + choice.title, action: #selector(start(_:)), keyEquivalent: "")
-            item.target = self; item.tag = choice.seconds; menu.addItem(item)
-        }
-        stopItem = NSMenuItem(title: "停止保持", action: #selector(stop), keyEquivalent: "")
-        stopItem.target = self; menu.addItem(stopItem)
-        menu.addItem(.separator())
-        let info = NSMenuItem(title: "作用与边界…", action: #selector(showInfo), keyEquivalent: "")
-        info.target = self; menu.addItem(info)
-        let quit = NSMenuItem(title: "退出常亮", action: #selector(quitApp), keyEquivalent: "q")
-        quit.target = self; menu.addItem(quit)
-        let show = NSMenuItem(title: "打开面板…", action: #selector(showPanel), keyEquivalent: "")
-        show.target = self; menu.insertItem(show, at: 1)
-        status.menu = menu
+        // One surface: the status item toggles the same transient panel.
+        // Do not retain a second NSMenu that competes with panel visibility.
+        status.button?.target = self
+        status.button?.action = #selector(togglePanel)
+        status.button?.sendAction(on: .leftMouseUp)
         timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.session.tick(); if self?.hold.healthy == false { self?.stop() }; self?.refresh() }
         RunLoop.main.add(timer!, forMode: .common)
         // Explicit sleep or switching away from this login session ends the hold.
@@ -117,29 +114,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh()
         showPanel()
     }
+    @objc func togglePanel() {
+        if let panel { panel.toggle(relativeTo: status.button) }
+        else { showPanel() }
+    }
     @objc func showPanel() {
-        if let panel { panel.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 235), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.title = "常亮"; window.isReleasedWhenClosed = false
+        if let panel { panel.present(relativeTo: status.button); return }
+        let window = TransientPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 235), styleMask: [.borderless], backing: .buffered, defer: false)
+        window.title = previewMode ? "常亮 · UI 预览" : "常亮"; window.isReleasedWhenClosed = false
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = true
         let view = window.contentView!
+        view.wantsLayer = true
+        view.layer?.cornerRadius = 12
+        view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        view.layer?.masksToBounds = true
         let title = NSTextField(labelWithString: "让远程工作，不被空闲打断。")
         title.font = .systemFont(ofSize: 17, weight: .semibold); title.frame = NSRect(x: 24, y: 178, width: 320, height: 25); view.addSubview(title)
         let state = NSTextField(labelWithString: "已关闭")
         state.frame = NSRect(x: 24, y: 145, width: 312, height: 22); view.addSubview(state); panelStatus = state
         let picker = NSPopUpButton(frame: NSRect(x: 22, y: 101, width: 178, height: 28))
         picker.addItems(withTitles: DurationChoice.all.map { $0.title }); picker.selectItem(at: 1); view.addSubview(picker); durationPicker = picker
+        if let migrationDeadline {
+            let formatter = DateFormatter(); formatter.dateFormat = "MM-dd HH:mm"
+            picker.addItem(withTitle: "恢复至 " + formatter.string(from: migrationDeadline))
+            picker.selectItem(at: DurationChoice.all.count)
+        }
         let start = NSButton(title: "开启", target: self, action: #selector(startFromPanel)); start.bezelStyle = .rounded; start.frame = NSRect(x: 210, y: 99, width: 62, height: 32); view.addSubview(start)
         let stop = NSButton(title: "停止", target: self, action: #selector(stop)); stop.bezelStyle = .rounded; stop.frame = NSRect(x: 276, y: 99, width: 62, height: 32); view.addSubview(stop)
         let note = NSTextField(wrappingLabelWithString: "临时暂停屏保和自动灭屏。到时恢复。\n手动锁屏与密码保护不变。")
         note.font = .systemFont(ofSize: 12); note.textColor = .secondaryLabelColor; note.frame = NSRect(x: 24, y: 33, width: 312, height: 45); view.addSubview(note)
-        panel = window; window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); refresh()
+        let info = NSButton(title: "说明", target: self, action: #selector(showInfo))
+        info.bezelStyle = .inline; info.frame = NSRect(x: 24, y: 8, width: 44, height: 22); view.addSubview(info)
+        let quit = NSButton(title: "退出", target: self, action: #selector(quitApp))
+        quit.bezelStyle = .inline; quit.frame = NSRect(x: 292, y: 8, width: 44, height: 22); view.addSubview(quit)
+        panel = window; window.center(); window.present(relativeTo: status.button); refresh()
     }
     @objc func startFromPanel() {
-        let item = NSMenuItem(); item.tag = DurationChoice.all[durationPicker?.indexOfSelectedItem ?? 1].seconds; start(item)
+        let index = durationPicker?.indexOfSelectedItem ?? 1
+        let item = NSMenuItem()
+        if index == DurationChoice.all.count, let migrationDeadline {
+            start(item, until: migrationDeadline)
+            return
+        } else { item.tag = DurationChoice.all[index].seconds }
+        start(item)
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showPanel(); return true }
-    func menuWillOpen(_ menu: NSMenu) { session.tick(); refresh() }
-    @objc func start(_ sender: NSMenuItem) {
+    func start(_ sender: NSMenuItem, until deadline: Date? = nil) {
         if !startedBefore {
             let alert = NSAlert()
             alert.messageText = "在可信环境中保持屏幕常亮"
@@ -149,7 +171,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard alert.runModal() == .alertFirstButtonReturn else { return }
             startedBefore = true
         }
-        do { try session.start(seconds: sender.tag == 0 ? nil : Double(sender.tag)) }
+        // Recompute AFTER modal confirmation: waiting must not extend the deadline.
+        let seconds: TimeInterval?
+        if let deadline {
+            guard let remaining = remainingBeforeDeadline(deadline) else { refresh(); return }
+            seconds = remaining
+        } else { seconds = sender.tag == 0 ? nil : Double(sender.tag) }
+        do { try session.start(seconds: seconds) }
         catch { let alert = NSAlert(error: error); alert.runModal() }
         refresh()
     }
@@ -159,12 +187,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let on = session.active
         let display = StatusPresentation(active: on, remaining: session.remainingSeconds, error: hold.lastError)
         status.button?.image = NSImage(systemSymbolName: display.symbol, accessibilityDescription: display.title)
-        status.button?.title = hold.lastError != nil ? " 待恢复" : (on ? " 常亮" : "")
+        status.button?.title = previewMode ? " 预览" : (hold.lastError != nil ? " 待恢复" : (on ? " 常亮" : ""))
         status.button?.toolTip = hold.lastError ?? (on ? "屏幕保持常亮；点击可停止" : "常亮已关闭；点击选择时长")
-        statusLine.title = display.title
         panelStatus?.stringValue = display.title
         panelStatus?.textColor = hold.lastError == nil ? .labelColor : .systemOrange
-        stopItem.isEnabled = display.canStop
+
     }
     @objc func showInfo() {
         let alert = NSAlert()
@@ -178,7 +205,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         observers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
     }
 }
+func remainingBeforeDeadline(_ deadline: Date, now: Date = Date()) -> TimeInterval? {
+    let remaining = deadline.timeIntervalSince(now)
+    return remaining > 0 ? remaining : nil
+}
 func selfTest() {
+    assert(TransientPanel.shouldDeferDismissal(overStatus: true, mouseGesture: true))
+    assert(!TransientPanel.shouldDeferDismissal(overStatus: true, mouseGesture: false)) // Cmd-Tab while hovering
+    assert(!TransientPanel.shouldDeferDismissal(overStatus: false, mouseGesture: true))
+    assert(!TransientPanel.shouldDeferDismissal(overStatus: false, mouseGesture: false))
+    let target = Date(timeIntervalSince1970: 10000)
+    assert(remainingBeforeDeadline(target, now: target.addingTimeInterval(-60)) == 60)
+    assert(remainingBeforeDeadline(target, now: target.addingTimeInterval(-5)) == 5)
+    assert(remainingBeforeDeadline(target, now: target) == nil)
+    assert(remainingBeforeDeadline(target, now: target.addingTimeInterval(1)) == nil)
     assert(DurationChoice.all.map { $0.seconds } == [1800, 3600, 7200, 10800, 21600, 43200, 0])
     assert(Set(DurationChoice.all.map { $0.title }).count == 7)
     final class Mock: PowerHolding {
@@ -214,7 +254,18 @@ func selfTest() {
     assert(off.title == "常亮 · 已关闭" && !off.canStop)
     print("PASS: 7 duration choices including 3/6/12 hours; monotonic expiry despite wall-clock jumps; recovery-error display/retry; default-off, start, expiry, duration replacement, indefinite, repeated stop, acquisition failure. No real assertions created.")
 }
-if CommandLine.arguments.contains("--restore-guardian") { runGuardian() }
+final class PreviewHold: SessionHolding {
+    var lastError: String? { nil }
+    var healthy: Bool { true }
+    func acquire() throws {}
+    func release() {}
+}
+if CommandLine.arguments.contains("--ui-preview") {
+    let app = NSApplication.shared
+    let delegate = AppDelegate(hold: PreviewHold(), preview: true); app.delegate = delegate
+    app.run()
+}
+else if CommandLine.arguments.contains("--restore-guardian") { runGuardian() }
 else if CommandLine.arguments.contains("--test-lock-holder") {
     try SaverRecovery.withLock { FileHandle.standardOutput.write(Data([1])); Thread.sleep(forTimeInterval: 3) }
 }

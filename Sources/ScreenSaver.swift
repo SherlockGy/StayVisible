@@ -62,7 +62,11 @@ enum SaverRecovery {
       }
     }
 }
-final class SaverHold: PowerHolding {
+protocol SessionHolding: PowerHolding {
+    var lastError: String? { get }
+    var healthy: Bool { get }
+}
+final class SaverHold: SessionHolding {
     let power = PowerHold()
     private var guardian: Process?
     private var writer: FileHandle?
